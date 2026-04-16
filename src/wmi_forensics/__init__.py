@@ -9,6 +9,7 @@ correlator    : link bindings ↔ filters ↔ consumers; detect orphans
 heuristics    : documented, explainable risk scoring
 reporter      : text / JSON / CSV output
 cli           : entry point
+class_carver  : keyword-focused class/context carving
 """
 
 __version__ = "2.0.0"

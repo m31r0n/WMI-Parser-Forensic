@@ -58,6 +58,29 @@ wmi-persistence -i OBJECTS.DATA -m MAPPING1.MAP
 wmi-persistence -i OBJECTS.DATA -v
 ```
 
+### Class keyword carve (HTB / reverse-engineering workflow)
+
+Use this when you want behaviour similar to:
+`auto_carve_class_definitions.py ... | grep -C 10 "<keyword>"`.
+
+```bash
+# Find class-related context around a keyword
+wmi-class-carve -i OBJECTS.DATA --find Win32_MemoryArrayDevice
+
+# Show more/less context lines (grep-like)
+wmi-class-carve -i OBJECTS.DATA --find Win32_MemoryArrayDevice -C 20
+
+# Save as JSON for automation
+wmi-class-carve -i OBJECTS.DATA --find Win32_MemoryArrayDevice -f json -o class_hits.json
+```
+
+If `wmi-class-carve` is not available in your PATH, use the built-in mode in
+`wmi-persistence` (same result):
+
+```bash
+wmi-persistence -i OBJECTS.DATA --class-find Win32_MemoryArrayDevice -C 20
+```
+
 ### Where to find OBJECTS.DATA
 
 ```

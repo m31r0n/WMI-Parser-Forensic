@@ -63,6 +63,13 @@ _CONSUMER_CLASS_NAMES: list[bytes] = [
     b"SMTPEventConsumer",
 ]
 
+# Normalised set used to reject class-definition noise.
+# When the extracted Name equals a known class name, the carver has matched
+# the schema definition, not an object instance — discard it.
+_CONSUMER_CLASS_NAME_SET: frozenset[str] = frozenset(
+    n.decode().lower() for n in _CONSUMER_CLASS_NAMES
+)
+
 def _u16(s: str) -> bytes:
     return s.encode("utf-16-le")
 
@@ -81,7 +88,7 @@ _FILTER_REF_RE         = re.compile(r"_EventFilter\.Name=[\"]{1,2}([^\"]+)[\"]{1
 _CONSUMER_REF_RE_ASCII = re.compile(rb"(\w+EventConsumer)\.Name=[\"]{1,2}([^\x00\"]+)[\"]{1,2}", re.IGNORECASE)
 _FILTER_REF_RE_ASCII   = re.compile(rb"_EventFilter\.Name=[\"]{1,2}([^\x00\"]+)[\"]{1,2}", re.IGNORECASE)
 
-_WQL_RE            = re.compile(r"SELECT\s+\S+\s+FROM\s+\w[\w_]*(?:\s+WHERE\s+.+?)?(?=\x00|\Z)", re.IGNORECASE | re.DOTALL)
+_WQL_RE            = re.compile(r"SELECT\s+\S+\s+FROM\s+\w[\w_]*[^\x00\r\n]*", re.IGNORECASE)
 _CMDLINE_RE        = re.compile(r"(?:CommandLineTemplate|ExecutablePath)\s*=?\s*[\"' ]?([^\x00\"'\r\n]{4,})", re.IGNORECASE)
 _SCRIPT_TEXT_RE    = re.compile(r"ScriptText\s*=?\s*[\"']?([^\x00\"']{10,})", re.IGNORECASE | re.DOTALL)
 _SCRIPTING_ENG_RE  = re.compile(r"ScriptingEngine\s*=?\s*[\"']?([^\x00\"'\r\n]{2,32})", re.IGNORECASE)
@@ -92,6 +99,20 @@ _LOGFILE_NAME_RE   = re.compile(r"Filename\s*=?\s*[\"']?([^\x00\"'\r\n]{2,})", r
 _LOGFILE_TEXT_RE   = re.compile(r"\bText\b\s*=?\s*[\"']?([^\x00\"'\r\n]{1,})", re.IGNORECASE)
 _EVTLOG_SOURCE_RE  = re.compile(r"SourceName\s*=?\s*[\"']?([^\x00\"'\r\n]{1,})", re.IGNORECASE)
 _NAMESPACE_RE      = re.compile(r"(root\\[\w\\]+)", re.IGNORECASE)
+
+# Legacy-oriented fallback patterns used only when modern property extraction
+# misses query/command fields.
+_WQL_BYTES_RE = re.compile(
+    rb"SELECT\s+\S+\s+FROM\s+\w[\w_]*[^\x00\r\n]*",
+    re.IGNORECASE,
+)
+_CMD_FALLBACK_RE = re.compile(
+    r"(?:cmd(?:\.exe)?\s*/[ck]\s+)?"
+    r"(?:powershell(?:\.exe)?|pwsh|wscript|cscript|mshta|regsvr32|rundll32|"
+    r"certutil|bitsadmin|msiexec|wmic|schtasks|at\.exe|installutil|regasm|"
+    r"regsvcs|odbcconf|ieexec|curl|wget)\b[^\x00\r\n]{0,20000}",
+    re.IGNORECASE,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -170,6 +191,7 @@ class WMICarver:
             self._scan_filters(chunk, chunk_offset, result)
             self._scan_consumers(chunk, chunk_offset, result)
         _deduplicate(result)
+        self._enrich_missing_fields(result)
         logger.info(
             "Scan complete: %d bindings, %d filters, %d consumers",
             len(result.bindings), len(result.filters), len(result.consumers),
@@ -348,14 +370,21 @@ class WMICarver:
     def _parse_consumer(
         self, ctx: bytes, abs_offset: int, class_name: str, encoding: DataEncoding
     ) -> EventConsumer | None:
-        m = re.search(
+        scoped = re.search(
             rb"(?:" + class_name.encode() + rb")\.Name=[\"']?([^\x00\"']{1,128})", ctx, re.IGNORECASE
-        ) or re.search(rb"Name\s*=\s*[\"']?([^\x00\"']{1,128})", ctx, re.IGNORECASE)
+        )
+        generic = None if scoped else re.search(
+            rb"Name\s*=\s*[\"']?([^\x00\"']{1,128})", ctx, re.IGNORECASE
+        )
+        m = scoped or generic
         if not m:
             return None
 
         name = m.group(1).decode("ascii", errors="replace").strip()
         if not name:
+            return None
+        if generic is not None and name.lower() in _CONSUMER_CLASS_NAME_SET:
+            # Reject schema noise only for generic Name= fallback matches.
             return None
 
         ns_m = re.search(rb"(root\\[\w\\]+)", ctx, re.IGNORECASE)
@@ -368,14 +397,21 @@ class WMICarver:
         )
 
     def _parse_consumer_utf16(self, text: str, abs_offset: int, class_name: str) -> EventConsumer | None:
-        m = re.search(
+        scoped = re.search(
             r"(?:" + re.escape(class_name) + r")\.Name=[\"']?([^\"'\x00]{1,128})", text, re.IGNORECASE
-        ) or re.search(r"(?<![A-Za-z])Name\s*=\s*[\"']?([^\"'\x00\r\n]{1,128})", text, re.IGNORECASE)
+        )
+        generic = None if scoped else re.search(
+            r"(?<![A-Za-z])Name\s*=\s*[\"']?([^\"'\x00\r\n]{1,128})", text, re.IGNORECASE
+        )
+        m = scoped or generic
         if not m:
             return None
 
         name = m.group(1).strip()
         if not name or "\ufffd" in name:
+            return None
+        if generic is not None and name.lower() in _CONSUMER_CLASS_NAME_SET:
+            # Reject schema noise only for generic Name= fallback matches.
             return None
 
         ns_m = _NAMESPACE_RE.search(text)
@@ -431,6 +467,143 @@ class WMICarver:
 
         return GenericEventConsumer(**common)
 
+    # ------------------------------------------------------------------
+    # Enrichment (legacy fallback patterns)
+    # ------------------------------------------------------------------
+
+    def _enrich_missing_fields(self, result: CarverResult) -> None:
+        """
+        Recover fields often stored far from class-name anchors:
+        - EventFilter.query
+        - CommandLineEventConsumer.command_line_template
+
+        This uses legacy regex fallback inspired by the original
+        PyWMIPersistenceFinder heuristics.
+        """
+        filters_missing_query = [f for f in result.filters if f.name and not f.query]
+        consumers_missing_cmd = [
+            c for c in result.consumers
+            if isinstance(c, CommandLineEventConsumer)
+            and c.name
+            and not (c.command_line_template or c.executable_path)
+        ]
+        if not filters_missing_query and not consumers_missing_cmd:
+            return
+
+        try:
+            data = self.objects_path.read_bytes()
+        except OSError as exc:
+            logger.debug("Enrichment skipped (cannot read %s): %s", self.objects_path, exc)
+            return
+
+        for event_filter in filters_missing_query:
+            query = self._recover_filter_query(event_filter.name, data)
+            if not query:
+                continue
+            event_filter.query = query
+            event_filter.confidence = max(event_filter.confidence, 0.85)
+            event_filter.parse_warnings = [
+                w for w in event_filter.parse_warnings if w.field_name != "query"
+            ]
+
+        for consumer in consumers_missing_cmd:
+            command = self._recover_command_line(consumer.name, data)
+            if not command:
+                continue
+            consumer.command_line_template = command
+            consumer.confidence = max(consumer.confidence, 0.9)
+
+    def _recover_filter_query(self, filter_name: str, data: bytes) -> str:
+        name_bytes = filter_name.encode("ascii", errors="ignore")
+        if not name_bytes:
+            return ""
+
+        # Legacy pattern: <name>\x00\x00<query>\x00\x00
+        best = ""
+        pattern = re.compile(re.escape(name_bytes) + rb"\x00\x00([^\x00]{8,4096})\x00\x00", re.IGNORECASE)
+        for match in pattern.finditer(data):
+            segment = match.group(1)
+            if wql := _WQL_BYTES_RE.search(segment):
+                candidate = wql.group(0).decode("ascii", errors="replace").strip()
+                if len(candidate) > len(best):
+                    best = candidate
+
+        if best:
+            return best
+
+        # Fallback: query may be nearby in another structure window.
+        return self._recover_query_near_name(filter_name, data)
+
+    def _recover_query_near_name(self, name: str, data: bytes) -> str:
+        best = ""
+
+        def scan_text(text: str) -> None:
+            nonlocal best
+            for match in _WQL_RE.finditer(text):
+                candidate = match.group(0).strip()
+                if len(candidate) > len(best):
+                    best = candidate
+
+        name_ascii = name.encode("ascii", errors="ignore")
+        if name_ascii:
+            for hit in _find_all(data, name_ascii):
+                start = max(0, hit - 8_192)
+                end = min(len(data), hit + 65_536)
+                scan_text(data[start:end].decode("ascii", errors="replace"))
+
+        name_utf16 = name.encode("utf-16-le", errors="ignore")
+        if name_utf16:
+            for hit in _find_all(data, name_utf16):
+                start = max(0, hit - 16_384)
+                if start % 2:
+                    start += 1
+                end = min(len(data), hit + 131_072)
+                scan_text(data[start:end].decode("utf-16-le", errors="replace"))
+
+        return best
+
+    def _recover_command_line(self, consumer_name: str, data: bytes) -> str:
+        name_bytes = consumer_name.encode("ascii", errors="ignore")
+        if not name_bytes:
+            return ""
+
+        best = ""
+        pattern = re.compile(
+            rb"CommandLineEventConsumer\x00\x00(.*?)\x00"
+            + re.escape(name_bytes)
+            + rb"(?:\x00\x00)?([^\x00]*)?",
+            re.IGNORECASE | re.DOTALL,
+        )
+        for match in pattern.finditer(data):
+            for group_idx in (1, 2):
+                blob = match.group(group_idx) or b""
+                candidate = self._extract_command_candidate(blob.decode("ascii", errors="replace"))
+                if len(candidate) > len(best):
+                    best = candidate
+
+        if best:
+            return best
+
+        # Fallback around explicit consumer-name hits.
+        for hit in _find_all(data, name_bytes):
+            start = max(0, hit - 16_384)
+            end = min(len(data), hit + 131_072)
+            candidate = self._extract_command_candidate(
+                data[start:end].decode("ascii", errors="replace")
+            )
+            if len(candidate) > len(best):
+                best = candidate
+
+        return best
+
+    @staticmethod
+    def _extract_command_candidate(text: str) -> str:
+        if m := _CMDLINE_RE.search(text):
+            return m.group(1).strip()
+        if m := _CMD_FALLBACK_RE.search(text):
+            return m.group(0).strip()
+        return ""
+
 
 # ---------------------------------------------------------------------------
 # Deduplication
@@ -438,22 +611,95 @@ class WMICarver:
 
 def _deduplicate(result: CarverResult) -> None:
     """Remove artefacts found twice due to chunk overlap."""
-    seen_b: set[tuple[str, str]] = set()
-    result.bindings = [
-        b for b in result.bindings
-        if (k := (b.consumer_name.lower(), b.filter_name.lower())) not in seen_b
-        and not seen_b.add(k)  # type: ignore[func-returns-value]
-    ]
+    result.bindings = _dedupe_best(
+        result.bindings,
+        key_fn=lambda b: (b.consumer_name.lower(), b.filter_name.lower()),
+        rank_fn=_binding_rank,
+    )
+    result.filters = _dedupe_best(
+        result.filters,
+        key_fn=lambda f: f.name.lower(),
+        rank_fn=_filter_rank,
+    )
+    result.consumers = _dedupe_best(
+        result.consumers,
+        key_fn=lambda c: (c.consumer_type.lower(), c.name.lower()),
+        rank_fn=_consumer_rank,
+    )
 
-    seen_f: set[str] = set()
-    result.filters = [
-        f for f in result.filters
-        if (k := f.name.lower()) not in seen_f and not seen_f.add(k)  # type: ignore[func-returns-value]
-    ]
 
-    seen_c: set[tuple[str, str]] = set()
-    result.consumers = [
-        c for c in result.consumers
-        if (k := (c.consumer_type.lower(), c.name.lower())) not in seen_c
-        and not seen_c.add(k)  # type: ignore[func-returns-value]
-    ]
+def _dedupe_best(items: list, key_fn, rank_fn) -> list:
+    """
+    Keep one item per key, preferring the richest artefact when duplicates exist.
+    """
+    best_by_key: dict = {}
+    key_order: list = []
+
+    for item in items:
+        key = key_fn(item)
+        if key not in best_by_key:
+            best_by_key[key] = item
+            key_order.append(key)
+            continue
+
+        if rank_fn(item) > rank_fn(best_by_key[key]):
+            best_by_key[key] = item
+
+    return [best_by_key[k] for k in key_order]
+
+
+def _state_rank(state: RecoveredState) -> int:
+    if state == RecoveredState.ACTIVE:
+        return 3
+    if state == RecoveredState.DELETED_RECOVERED:
+        return 2
+    if state == RecoveredState.CARVED:
+        return 1
+    return 0
+
+
+def _binding_rank(binding: FilterToConsumerBinding) -> tuple[int, float, int, int]:
+    return (
+        int(bool(binding.namespace)),
+        binding.confidence,
+        int(binding.encoding == DataEncoding.UTF16LE),
+        _state_rank(binding.recovered_state),
+    )
+
+
+def _filter_rank(event_filter: EventFilter) -> tuple[int, int, int, float, int]:
+    return (
+        int(bool(event_filter.query)),
+        int(bool(event_filter.namespace)),
+        int(event_filter.encoding == DataEncoding.UTF16LE),
+        event_filter.confidence,
+        _state_rank(event_filter.recovered_state),
+    )
+
+
+def _consumer_rank(consumer: EventConsumer) -> tuple[int, int, int, float, int]:
+    return (
+        _consumer_detail_score(consumer),
+        int(bool(consumer.namespace)),
+        int(consumer.encoding == DataEncoding.UTF16LE),
+        consumer.confidence,
+        _state_rank(consumer.recovered_state),
+    )
+
+
+def _consumer_detail_score(consumer: EventConsumer) -> int:
+    if isinstance(consumer, CommandLineEventConsumer):
+        return int(bool(consumer.command_line_template)) + int(bool(consumer.executable_path))
+    if isinstance(consumer, ActiveScriptEventConsumer):
+        return (2 * int(bool(consumer.script_text))) + int(bool(consumer.scripting_engine))
+    if isinstance(consumer, NTEventLogEventConsumer):
+        return int(bool(consumer.source_name)) + int(consumer.event_id is not None)
+    if isinstance(consumer, LogFileEventConsumer):
+        return int(bool(consumer.filename)) + int(bool(consumer.text))
+    if isinstance(consumer, SMTPEventConsumer):
+        return (
+            int(bool(consumer.smtp_server))
+            + int(bool(consumer.to_line))
+            + int(bool(consumer.subject))
+        )
+    return 0

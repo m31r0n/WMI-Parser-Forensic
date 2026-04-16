@@ -16,6 +16,7 @@ dev = ["pytest>=7.4", "pytest-cov>=4.1"]
 
 [project.scripts]
 wmi-persistence = "wmi_forensics.cli:main"
+wmi-class-carve = "wmi_forensics.class_carve_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -81,7 +81,9 @@ class TestTextReporter:
         score_bundle(bundle)
         cr = _make_correlation([bundle])
         report = write_report(cr, fmt="text", use_colour=False, include_legitimate=False)
-        assert "BVTConsumer" not in report
+        # The name appears in the "Suppressed (legit)" summary line but NOT as a full binding
+        assert "[ BINDING ]" not in report
+        assert "Suppressed" in report
 
     def test_legitimate_shown_when_requested(self):
         bundle = _simple_bundle(consumer_name="BVTConsumer", filter_name="BVTFilter")

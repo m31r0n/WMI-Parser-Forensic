@@ -21,6 +21,7 @@ import sys
 from pathlib import Path
 
 from .carver import WMICarver
+from .class_carver import carve_class_context, render_hits_json, render_hits_text
 from .correlator import WMICorrelator
 from .heuristics import score_bundle
 from .reporter import write_report
@@ -104,6 +105,16 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Only report bindings with risk_score >= SCORE (0.0-1.0)")
     p.add_argument("--no-colour", action="store_true", default=False,
                    help="Disable ANSI colour in text output")
+    p.add_argument("--class-find", metavar="TEXT", default=None,
+                   help="Class/keyword carving mode (example: Win32_MemoryArrayDevice)")
+    p.add_argument("-C", "--context", type=int, default=10, metavar="N",
+                   help="Context lines around class keyword hits (default: 10)")
+    p.add_argument("--class-window-bytes", type=int, default=65536, metavar="N",
+                   help="Bytes before/after each class hit to inspect (default: 65536)")
+    p.add_argument("--class-max-hits", type=int, default=20, metavar="N",
+                   help="Maximum class hit blocks to report (default: 20)")
+    p.add_argument("--class-min-string-len", type=int, default=6, metavar="N",
+                   help="Minimum extracted string length in class mode (default: 6)")
     p.add_argument("-v", "--verbose", action="store_true", default=False,
                    help="Enable debug logging")
     return p
@@ -129,12 +140,42 @@ def main() -> int:
     output_path  = Path(args.output) if args.output else None
 
     print(f"  OBJECTS.DATA : {objects_path}", file=sys.stderr)
-    if mapping_path:
-        print(f"  Mapping file : {mapping_path}", file=sys.stderr)
+    if args.class_find:
+        print(f"  Class find   : {args.class_find}", file=sys.stderr)
     else:
-        print("  Mapping file : not found (allocation state will be UNKNOWN)", file=sys.stderr)
+        if mapping_path:
+            print(f"  Mapping file : {mapping_path}", file=sys.stderr)
+        else:
+            print("  Mapping file : not found (allocation state will be UNKNOWN)", file=sys.stderr)
 
     try:
+        if args.class_find:
+            if args.output_format not in ("text", "json"):
+                print("ERROR: class mode supports only -f text or -f json", file=sys.stderr)
+                return 2
+
+            hits = carve_class_context(
+                objects_path,
+                args.class_find,
+                context_lines=max(0, args.context),
+                window_bytes=max(512, args.class_window_bytes),
+                max_hits=max(1, args.class_max_hits),
+                min_string_len=max(3, args.class_min_string_len),
+            )
+
+            report = (
+                render_hits_json(objects_path, args.class_find, hits)
+                if args.output_format == "json"
+                else render_hits_text(objects_path, args.class_find, hits)
+            )
+
+            if output_path:
+                output_path.write_text(report, encoding="utf-8")
+                print(f"  Report written to {output_path}", file=sys.stderr)
+            else:
+                print(report)
+            return 0
+
         carver = WMICarver(objects_path, mapping_path=mapping_path, auto_find_mapping=False)
         carver_result = carver.scan()
 

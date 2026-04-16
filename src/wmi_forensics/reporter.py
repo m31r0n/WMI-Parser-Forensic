@@ -50,8 +50,10 @@ def write_report(
     min_risk_score: float = 0.0,
     use_colour: bool = True,
 ) -> str:
+    all_bundles = correlation_result.bundles
+    suppressed_legitimate = [b for b in all_bundles if b.is_known_legitimate and not include_legitimate]
     bundles = [
-        b for b in correlation_result.bundles
+        b for b in all_bundles
         if (include_legitimate or not b.is_known_legitimate)
         and b.risk_score >= min_risk_score
     ]
@@ -63,7 +65,8 @@ def write_report(
         content = _csv(bundles)
     else:
         content = _text(bundles, correlation_result.orphaned_filters,
-                        correlation_result.orphaned_consumers, use_colour)
+                        correlation_result.orphaned_consumers, use_colour,
+                        suppressed_legitimate=suppressed_legitimate)
 
     if output_file:
         output_file.write_text(content, encoding="utf-8")
@@ -79,7 +82,9 @@ def _text(
     orphaned_filters: list[EventFilter],
     orphaned_consumers: list[EventConsumer],
     use_colour: bool,
+    suppressed_legitimate: list[WMIPersistenceBundle] | None = None,
 ) -> str:
+    suppressed_legitimate = suppressed_legitimate or []
     out = io.StringIO()
     w = lambda s="": out.write(s + "\n")
 
@@ -94,10 +99,14 @@ def _text(
     w(f"  Low               : {sum(1 for b in bundles if b.risk_level == 'low')}")
     w(f"  Orphaned filters  : {len(orphaned_filters)}")
     w(f"  Orphaned consumers: {len(orphaned_consumers)}")
+    if suppressed_legitimate:
+        names = ", ".join(b.display_name() for b in suppressed_legitimate)
+        w(f"  Suppressed (legit): {len(suppressed_legitimate)} — {names}")
+        w("    (use --include-legitimate to show them)")
 
     if not bundles:
         w()
-        w("  No persistence bindings found (above threshold).")
+        w("  No persistence bindings found above threshold.")
 
     for bundle in sorted(bundles, key=lambda b: b.risk_score, reverse=True):
         _bundle_text(bundle, out, use_colour)
@@ -116,12 +125,16 @@ def _text(
     if orphaned_consumers:
         w()
         w("-" * 72)
-        w("  ORPHANED EVENT CONSUMERS")
+        w("  ORPHANED EVENT CONSUMERS  (no binding found)")
+        w("  NOTE: may be residual objects from deleted persistence, legitimate")
+        w("  providers, or partial carver matches. Verify offsets manually.")
         w("-" * 72)
         for c in orphaned_consumers:
+            w()
             w(f"  {c.name}  ({c.consumer_type})")
-            w(f"    Offset : 0x{c.offset:08X}" if c.offset >= 0 else "    Offset : unknown")
-            w(f"    State  : {c.recovered_state.value}  conf={c.confidence:.0%}")
+            w(f"    Namespace: {c.namespace or '(not extracted)'}")
+            w(f"    Offset   : 0x{c.offset:08X}  state={c.recovered_state.value}  conf={c.confidence:.0%}" if c.offset >= 0 else "    Offset   : unknown")
+            _consumer_details(c, out)
 
     w()
     w("=" * 72)

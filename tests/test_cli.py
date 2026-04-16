@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from wmi_forensics.cli import resolve_input
+from wmi_forensics.cli import _build_parser, main, resolve_input
 
 
 def _make_od(directory: Path, name: str = "OBJECTS.DATA") -> Path:
@@ -84,3 +84,41 @@ class TestResolveInput:
         od = _make_od(tmp_path, name="objects.data")
         result, _ = resolve_input(tmp_path)
         assert result == od
+
+
+class TestClassModeCli:
+    def test_parser_accepts_class_mode_args(self):
+        p = _build_parser()
+        args = p.parse_args([
+            "-i", "OBJECTS.DATA",
+            "--class-find", "Win32_MemoryArrayDevice",
+            "-C", "5",
+            "--class-max-hits", "3",
+        ])
+        assert args.class_find == "Win32_MemoryArrayDevice"
+        assert args.context == 5
+        assert args.class_max_hits == 3
+
+    def test_main_class_mode_text(self, tmp_path, monkeypatch, capsys):
+        od = _make_od(tmp_path)
+        od.write_bytes(
+            b"header\x00Win32_MemoryArrayDevice\x00\x00payload\x00\x00"
+        )
+        monkeypatch.setattr(
+            "sys.argv",
+            ["wmi-persistence", "-i", str(od), "--class-find", "Win32_MemoryArrayDevice", "-C", "2"],
+        )
+        rc = main()
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "WMI Class Carver" in out
+        assert "Win32_MemoryArrayDevice" in out
+
+    def test_main_class_mode_rejects_csv(self, tmp_path, monkeypatch):
+        od = _make_od(tmp_path)
+        monkeypatch.setattr(
+            "sys.argv",
+            ["wmi-persistence", "-i", str(od), "--class-find", "Win32_MemoryArrayDevice", "-f", "csv"],
+        )
+        rc = main()
+        assert rc == 2
