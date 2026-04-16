@@ -1,11 +1,16 @@
 """
 wmi-persistence — offline forensic analysis of WMI OBJECTS.DATA files.
 
+-i acepta un fichero OR una carpeta:
+    -i OBJECTS.DATA                 fichero directo
+    -i C:\\evidence\\Repository     busca OBJECTS.DATA dentro (y MAPPING*.MAP)
+    -i C:\\evidence\\               busca en subcarpetas Repository/ y FS/
+
 Examples:
     wmi-persistence -i OBJECTS.DATA
+    wmi-persistence -i "C:\\Windows\\System32\\wbem\\Repository"
     wmi-persistence -i OBJECTS.DATA -f json -o report.json
     wmi-persistence -i OBJECTS.DATA -m MAPPING1.MAP --min-risk 0.6
-    wmi-persistence -i OBJECTS.DATA --include-legitimate --no-colour
 """
 
 from __future__ import annotations
@@ -20,15 +25,73 @@ from .correlator import WMICorrelator
 from .heuristics import score_bundle
 from .reporter import write_report
 
+# Candidate names for OBJECTS.DATA, in priority order
+_OD_NAMES = ["OBJECTS.DATA", "objects.data"]
+
+# Subdirectories that WMI uses on different Windows versions
+_REPO_SUBDIRS = ["", "Repository", "FS"]
+
+
+def resolve_input(input_path: Path) -> tuple[Path, Path | None]:
+    """
+    Accept either a direct OBJECTS.DATA path or a directory.
+
+    When given a directory, searches for OBJECTS.DATA in:
+        <dir>/
+        <dir>/Repository/
+        <dir>/FS/
+
+    Returns (objects_data_path, mapping_path_or_None).
+    Raises FileNotFoundError if nothing is found.
+    """
+    if input_path.is_file():
+        mapping = _find_mapping(input_path.parent)
+        return input_path, mapping
+
+    if input_path.is_dir():
+        for subdir in _REPO_SUBDIRS:
+            candidate_dir = input_path / subdir if subdir else input_path
+            for name in _OD_NAMES:
+                candidate = candidate_dir / name
+                if candidate.is_file():
+                    mapping = _find_mapping(candidate_dir)
+                    return candidate, mapping
+
+        # List what was found to help the user
+        found = list(input_path.rglob("OBJECTS.DATA")) + list(input_path.rglob("objects.data"))
+        if found:
+            hint = f"\n  Did you mean one of these?\n" + "\n".join(f"    {p}" for p in found[:5])
+        else:
+            hint = ""
+        raise FileNotFoundError(
+            f"OBJECTS.DATA not found under '{input_path}'.{hint}"
+        )
+
+    raise FileNotFoundError(f"Path not found: '{input_path}'")
+
+
+def _find_mapping(directory: Path) -> Path | None:
+    """Return the most recently modified MAPPING*.MAP in *directory*, or None."""
+    candidates = list(directory.glob("MAPPING*.MAP")) + list(directory.glob("MAPPING*.map"))
+    return max(candidates, key=lambda p: p.stat().st_mtime) if candidates else None
+
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="wmi-persistence",
-        description="Offline forensic analysis of WMI OBJECTS.DATA files.",
+        description=(
+            "Offline forensic analysis of WMI OBJECTS.DATA files.\n"
+            "-i acepta un fichero o una carpeta (Repository, evidencia montada, etc.)"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("-i", "--input", required=True, metavar="OBJECTS.DATA",
-                   help="Path to OBJECTS.DATA")
+    p.add_argument(
+        "-i", "--input", required=True, metavar="PATH",
+        help=(
+            "OBJECTS.DATA file, or a directory that contains it "
+            "(e.g. the Repository folder or its parent)"
+        ),
+    )
     p.add_argument("-m", "--mapping", metavar="MAPPING.MAP", default=None,
                    help="MAPPING1.MAP or MAPPING2.MAP (auto-detected if omitted)")
     p.add_argument("-f", "--format", choices=["text", "json", "csv"], default="text",
@@ -55,18 +118,24 @@ def main() -> int:
         stream=sys.stderr,
     )
 
-    objects_path = Path(args.input)
-    if not objects_path.is_file():
-        print(f"ERROR: Input file not found: {objects_path}", file=sys.stderr)
+    try:
+        objects_path, auto_mapping = resolve_input(Path(args.input))
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
-    mapping_path = Path(args.mapping) if args.mapping else None
+    # Explicit -m overrides auto-detected mapping
+    mapping_path = Path(args.mapping) if args.mapping else auto_mapping
     output_path  = Path(args.output) if args.output else None
 
-    print(f"  Scanning {objects_path} ...", file=sys.stderr)
+    print(f"  OBJECTS.DATA : {objects_path}", file=sys.stderr)
+    if mapping_path:
+        print(f"  Mapping file : {mapping_path}", file=sys.stderr)
+    else:
+        print("  Mapping file : not found (allocation state will be UNKNOWN)", file=sys.stderr)
 
     try:
-        carver = WMICarver(objects_path, mapping_path=mapping_path)
+        carver = WMICarver(objects_path, mapping_path=mapping_path, auto_find_mapping=False)
         carver_result = carver.scan()
 
         print(
