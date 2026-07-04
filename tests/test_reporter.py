@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-import json
+import io
+import zipfile
 
 import pytest
 
@@ -105,64 +106,38 @@ class TestTextReporter:
         assert "LowRisk" not in report
 
 
-class TestJsonReporter:
-    def test_valid_json(self):
+def _sheet_text(data: bytes, sheet_no: int = 2) -> str:
+    zf = zipfile.ZipFile(io.BytesIO(data))
+    return zf.read(f"xl/worksheets/sheet{sheet_no}.xml").decode("utf-8")
+
+
+class TestXlsxReporter:
+    def test_requires_output_file(self):
         cr = _make_correlation([_simple_bundle()])
-        report = write_report(cr, fmt="json", use_colour=False)
-        doc = json.loads(report)
-        assert "bundles" in doc
-        assert "summary" in doc
-        assert "scan_metadata" in doc
+        with pytest.raises(ValueError):
+            write_report(cr, fmt="xlsx", output_file=None)
 
-    def test_bundle_fields_present(self):
+    def test_writes_workbook(self, tmp_path):
         cr = _make_correlation([_simple_bundle()])
-        doc = json.loads(write_report(cr, fmt="json"))
-        b = doc["bundles"][0]
-        assert "artifact_id" in b
-        assert "risk_score" in b
-        assert "risk_level" in b
-        assert "detection_reasons" in b
-        assert "binding" in b
+        out = tmp_path / "report.xlsx"
+        result = write_report(cr, fmt="xlsx", output_file=out)
+        assert result == ""
+        assert out.exists()
+        zf = zipfile.ZipFile(out)
+        # Summary + Bindings + Risk Factors + Orphaned Filters/Consumers
+        assert "xl/worksheets/sheet5.xml" in zf.namelist()
 
-    def test_bytes_are_hex_strings(self):
-        """raw_preview bytes must be serialised as hex strings, not crash."""
-        bundle = _simple_bundle()
-        bundle.binding.raw_preview = b"\xde\xad\xbe\xef"
-        cr = _make_correlation([bundle])
-        doc = json.loads(write_report(cr, fmt="json"))
-        assert doc["bundles"][0]["binding"]["raw_preview"] == "deadbeef"
-
-    def test_empty_result_valid_json(self):
-        cr = _make_correlation([])
-        doc = json.loads(write_report(cr, fmt="json"))
-        assert doc["bundles"] == []
-        assert doc["summary"]["total_bundles"] == 0
-
-    def test_summary_counts(self):
-        bundles = []
-        for i in range(3):
-            b = _simple_bundle(consumer_name=f"C{i}", filter_name=f"F{i}")
-            b.risk_score = 0.7
-            b.risk_level = "high"
-            bundles.append(b)
-        cr = _make_correlation(bundles)
-        doc = json.loads(write_report(cr, fmt="json"))
-        assert doc["summary"]["total_bundles"] == 3
-        assert doc["summary"]["high"] == 3
-
-
-class TestCsvReporter:
-    def test_produces_tsv_header(self):
+    def test_bindings_sheet_has_data(self, tmp_path):
         cr = _make_correlation([_simple_bundle()])
-        report = write_report(cr, fmt="csv", use_colour=False)
-        assert "artifact_id" in report
-        assert "risk_level" in report
-        assert "consumer_name" in report
+        out = tmp_path / "report.xlsx"
+        write_report(cr, fmt="xlsx", output_file=out)
+        bindings = _sheet_text(out.read_bytes(), sheet_no=2)
+        assert "TestConsumer" in bindings
+        assert "TestFilter" in bindings
 
-    def test_one_row_per_bundle(self):
-        bundles = [_simple_bundle(consumer_name=f"C{i}", filter_name=f"F{i}") for i in range(3)]
-        cr = _make_correlation(bundles)
-        report = write_report(cr, fmt="csv")
-        lines = [l for l in report.strip().split("\n") if l]
-        # header + 3 data rows
-        assert len(lines) == 4
+    def test_full_command_not_truncated(self, tmp_path):
+        long_cmd = "powershell -enc " + "A" * 2000
+        cr = _make_correlation([_simple_bundle(command=long_cmd)])
+        out = tmp_path / "report.xlsx"
+        write_report(cr, fmt="xlsx", output_file=out)
+        assert long_cmd in _sheet_text(out.read_bytes(), sheet_no=2)

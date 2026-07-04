@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import io
+import zipfile
 from pathlib import Path
 
-from wmi_forensics.class_carver import carve_class_context, render_hits_json, render_hits_text
+from wmi_forensics.class_carver import carve_class_context, render_hits_text, render_hits_xlsx
 
 
 def test_finds_ascii_and_utf16_keyword(tmp_path: Path):
@@ -30,11 +32,13 @@ def test_renderers_include_expected_fields(tmp_path: Path):
 
     hits = carve_class_context(od, "Win32_MemoryArrayDevice")
     text = render_hits_text(od, "Win32_MemoryArrayDevice", hits)
-    js = render_hits_json(od, "Win32_MemoryArrayDevice", hits)
+    data = render_hits_xlsx(od, "Win32_MemoryArrayDevice", hits)
 
     assert "WMI Class Carver" in text
     assert "Win32_MemoryArrayDevice" in text
-    assert '"needle": "Win32_MemoryArrayDevice"' in js
+    zf = zipfile.ZipFile(io.BytesIO(data))
+    sheet = zf.read("xl/worksheets/sheet1.xml").decode("utf-8")
+    assert "Win32_MemoryArrayDevice" in sheet
 
 
 def test_no_hits(tmp_path: Path):

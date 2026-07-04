@@ -4,12 +4,31 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wmi-forensics"
-version = "2.0.0"
+version = "2.1.0"
 description = "Offline forensic analysis of WMI/CIM repositories for DFIR investigations"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
+authors = [{ name = "m31r0n" }]
+keywords = ["dfir", "forensics", "wmi", "cim", "persistence", "incident-response", "windows", "threat-hunting"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Topic :: System :: Systems Administration",
+]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/m31r0n/WMI-Parser-Forensic"
+Repository = "https://github.com/m31r0n/WMI-Parser-Forensic"
+Issues = "https://github.com/m31r0n/WMI-Parser-Forensic/issues"
 
 [project.optional-dependencies]
 dev = ["pytest>=7.4", "pytest-cov>=4.1"]
@@ -17,6 +36,8 @@ dev = ["pytest>=7.4", "pytest-cov>=4.1"]
 [project.scripts]
 wmi-persistence = "wmi_forensics.cli:main"
 wmi-class-carve = "wmi_forensics.class_carve_cli:main"
+wmi-rua = "wmi_forensics.rua_cli:main"
+wmi-hunt = "wmi_forensics.hunt_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

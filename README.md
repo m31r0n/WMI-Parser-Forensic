@@ -1,14 +1,17 @@
-# WMI Forensics — v2.0
+# WMI Forensics — v2.1
 
 Offline forensic analysis of WMI/CIM repository files for DFIR investigations.
 
 Detects **FilterToConsumerBinding persistence** artefacts — active, deleted,
-and carved — with documented, explainable risk scoring.  
+and carved — with documented, explainable risk scoring, and recovers
+**SCCM software-execution history** (`CCM_RecentlyUsedApps`).  
 Works entirely offline against acquired evidence; never executes recovered content.
 
 ---
 
 ## What it detects
+
+**Persistence** (`persistence` mode):
 
 | Artefact type | Coverage |
 |---|---|
@@ -23,73 +26,260 @@ Works entirely offline against acquired evidence; never executes recovered conte
 | Orphaned filters / consumers | Yes — reported separately |
 | Non-standard namespaces | Detected and flagged |
 
+**Software execution** (`rua` mode):
+
+| Artefact type | Coverage |
+|---|---|
+| `CCM_RecentlyUsedApps` (SCCM software metering) | Full path, launch count, last-used time, user, file size, product metadata |
+| Full / carved / XML record formats | Yes — deleted records recovered when the binary header survives |
+
+**Class definitions** (`carve` mode): best-effort structured decode of CIM
+class definitions (classname, properties, CIM types, full default values), with
+a grep-style raw string fallback (`--raw`).
+
+**Embedded payloads** (`hunt` mode / `carve --decode`): detect and extract
+executables/scripts hidden in class property values (Base64 + inflate/gzip →
+PE/.NET/ZIP/script), with SHA-256 and file-type — the fileless "class as
+storage" technique (MITRE T1546.003).
+
 ---
 
 ## Installation
 
+**None required.** Python 3.11+ and the standard library are enough — the core
+tool has no third-party dependencies. Clone (or copy) the repository and run the
+launcher directly:
+
 ```bash
-# From the repository root:
-pip install -e ".[dev]"
+python wmi.py persistence -i /evidence/Repository
+python wmi.py carve       -i /evidence/Repository --find Win32_Process
 ```
 
-Python 3.11+ required.  No external dependencies for the core tool.
+`wmi.py` (at the repository root) adds `src/` to the import path for you, so it
+works from any working directory with no `pip install` and no `PYTHONPATH`
+setup.
+
+### Optional: install for short command names
+
+If you prefer `wmi-persistence` / `wmi-class-carve` on your PATH (e.g. to run
+from anywhere without typing `python wmi.py`), install it editable:
+
+```bash
+pip install -e .          # add "[dev]" to also get pytest for the test suite
+```
+
+After that, these are all equivalent:
+
+| Zero-install launcher | Installed command |
+|---|---|
+| `python wmi.py persistence …` | `wmi-persistence …` |
+| `python wmi.py rua …` | `wmi-rua …` |
+| `python wmi.py carve …` | `wmi-class-carve …` |
+| `python wmi.py hunt …` | `wmi-hunt …` |
 
 ---
 
 ## Usage
 
-```bash
-# Text report to stdout (most common)
-wmi-persistence -i /evidence/OBJECTS.DATA
+The tool has four **modes**, all driven by `python wmi.py <mode>`:
 
-# JSON report for SIEM/automation
-wmi-persistence -i OBJECTS.DATA -f json -o report.json
+| Mode | Purpose |
+|---|---|
+| `persistence` | Detect and score WMI event-subscription persistence (the main DFIR mode; used if no mode is given) |
+| `rua` | Recover SCCM `CCM_RecentlyUsedApps` software-execution records |
+| `carve` | Structured decode of a class definition (`--decode`/`--dump` to extract embedded payloads); `--raw` for the string view |
+| `hunt` | Auto-discover classes hiding an embedded payload in a property value (fileless storage) |
+
+**Where reports go:** by default, `xlsx` reports and extracted payloads are
+written **next to the evidence** (the OBJECTS.DATA folder), not the tool's
+directory — pass `-o` to override. Every `xlsx` opens with an **Executive
+Summary** sheet followed by the technical detail sheets.
+
+Both accept a **file** or a **directory** with `-i`. Given a directory, the
+tool auto-locates `OBJECTS.DATA` (searching the folder, `Repository/`, and
+`FS/`) and any adjacent `MAPPING*.MAP`.
+
+> The examples below use the zero-install launcher `python wmi.py <mode>`.
+> If you installed the package (`pip install -e .`), the installed commands
+> `wmi-persistence`, `wmi-rua`, `wmi-class-carve`, and `wmi-hunt` are drop-in
+> equivalents of `python wmi.py persistence` / `rua` / `carve` / `hunt` — the
+> options are identical.
+
+### Quick start
+
+```bash
+# Point at the acquired Repository folder and read the report
+python wmi.py persistence -i /evidence/wbem/Repository
+```
+
+### Typical DFIR workflow
+
+1. **Acquire** the WMI repository from the evidence (see [paths](#where-to-find-the-repository)).
+   Copy the whole `Repository` folder so `OBJECTS.DATA` and `MAPPING*.MAP`
+   stay together — the mapping file is what distinguishes live from deleted
+   artefacts.
+2. **Triage** with a text report to spot high-risk bindings quickly:
+   ```bash
+   python wmi.py persistence -i /evidence/wbem/Repository --min-risk 0.6
+   ```
+3. **Export** structured output for your case notes / SIEM:
+   ```bash
+   python wmi.py persistence -i /evidence/wbem/Repository -f xlsx -o wmi_findings.xlsx
+   ```
+4. **Confirm** each finding in a hex viewer using the `offset` field reported
+   for every artefact — the score is triage, never a verdict.
+5. **Carve deeper** into any suspicious class or string with the `carve` mode
+   (below).
+
+### `persistence` mode — option reference
+
+```
+python wmi.py persistence -i PATH [options]
+```
+
+| Option | Description |
+|---|---|
+| `-i, --input PATH` | **Required.** `OBJECTS.DATA` file, or a directory containing it (Repository folder or its parent, mounted image, etc.). |
+| `-m, --mapping FILE` | `MAPPING1.MAP` / `MAPPING2.MAP`. Auto-detected next to `OBJECTS.DATA` if omitted. Enables `active` vs `deleted_recovered` labelling. |
+| `-f, --format {txt,xlsx}` | Output format. Default `txt`. xlsx requires `-o FILE`. |
+| `-o, --output FILE` | Write the report to `FILE` instead of stdout. |
+| `--min-risk SCORE` | Only report bindings with `risk_score >= SCORE` (0.0–1.0). |
+| `--include-legitimate` | Also show known-legitimate Microsoft bindings (BVT, SCM, …) that are suppressed by default. |
+| `--no-colour` | Disable ANSI colour in text output (for redirection/logging). |
+| `-v, --verbose` | Debug logging to stderr. |
+
+Progress and file-resolution messages go to **stderr**; the report goes to
+**stdout** (or `-o`), so piping and redirection stay clean.
+
+```bash
+# Excel report for triage
+python wmi.py persistence -i OBJECTS.DATA -f xlsx -o report.xlsx
 
 # Include known-legitimate Microsoft bindings
-wmi-persistence -i OBJECTS.DATA --include-legitimate
+python wmi.py persistence -i OBJECTS.DATA --include-legitimate
 
-# Only show high-risk findings (score ≥ 0.6)
-wmi-persistence -i OBJECTS.DATA --min-risk 0.6
-
-# Provide mapping file explicitly (enables deleted-artefact labelling)
-wmi-persistence -i OBJECTS.DATA -m MAPPING1.MAP
-
-# Verbose debug logging (writes to stderr)
-wmi-persistence -i OBJECTS.DATA -v
+# Provide the mapping file explicitly (evidence stored elsewhere)
+python wmi.py persistence -i OBJECTS.DATA -m /evidence/MAPPING1.MAP
 ```
 
-### Class keyword carve (HTB / reverse-engineering workflow)
+### `carve` mode — class definitions and keyword carving
 
-Use this when you want behaviour similar to:
-`auto_carve_class_definitions.py ... | grep -C 10 "<keyword>"`.
+By default `carve` produces a **best-effort structured decode** of the CIM
+class definition(s) matching a keyword — classname, superclass, timestamp,
+properties (name + CIM type), and full **untruncated** default/string values —
+laid out similarly to FLARE `python-cim`. Use it to:
+
+- inspect a specific WMI class definition (e.g. `Win32_Process`, a custom
+  provider class, or a suspicious class name from another tool);
+- recover data an attacker stashed inside a WMI class **property** default
+  value (a common fileless-storage technique) — the full payload, never clipped;
+- fall back to a grep-style string view (`--raw`) for markers (filenames, URLs)
+  anywhere in the raw repository.
 
 ```bash
-# Find class-related context around a keyword
-wmi-class-carve -i OBJECTS.DATA --find Win32_MemoryArrayDevice
+# Structured class-definition decode (default)
+python wmi.py carve -i /evidence/Repository --find Win32_MemoryArrayDevice
 
-# Show more/less context lines (grep-like)
-wmi-class-carve -i OBJECTS.DATA --find Win32_MemoryArrayDevice -C 20
+# Excel workbook (Classes / Properties / Default Values sheets)
+python wmi.py carve -i /evidence/Repository --find Win32_MemoryArrayDevice -f xlsx -o class.xlsx
 
-# Save as JSON for automation
-wmi-class-carve -i OBJECTS.DATA --find Win32_MemoryArrayDevice -f json -o class_hits.json
+# Raw string-context view (grep-like), untruncated
+python wmi.py carve -i /evidence/Repository --find Win32_MemoryArrayDevice --raw -C 20
 ```
 
-If `wmi-class-carve` is not available in your PATH, use the built-in mode in
-`wmi-persistence` (same result):
+| Option | Description |
+|---|---|
+| `-i, --input PATH` | **Required.** File or directory (same resolution as `persistence` mode). |
+| `--find, -q TEXT` | **Required.** Keyword / class name to decode (ASCII + UTF-16LE). |
+| `--raw` | Force the raw string-context view instead of the structured decode. |
+| `--decode` | Decode property default values (Base64 + inflate/gzip) and report the embedded file type + SHA-256. |
+| `--dump [DIR]` | Extract decoded payloads to `DIR` (implies `--decode`; default: a folder next to the evidence). |
+| `-C, --context N` | (raw view) Context lines around each match. Default `10`. |
+| `--window-bytes N` | (raw view) Bytes before/after each hit to inspect. Default `65536`. |
+| `--max-hits N` | Cap on definitions / hit blocks reported. Default `20`. |
+| `--min-string-len N` | (raw view) Minimum extracted string length. Default `6`. |
+| `-f, --format {txt,xlsx}` | Output format. Default `txt`. xlsx auto-names next to the evidence unless `-o`. |
+| `-o, --output FILE` | Write to `FILE` instead of stdout / the default location. |
+
+### `hunt` mode — find classes hiding a payload
+
+When you **don't** know which class hides a payload, `hunt` scans the whole
+repository for property values that decode to real executables/scripts and
+tells you the class, property, file type, SHA-256, and timestamp:
 
 ```bash
-wmi-persistence -i OBJECTS.DATA --class-find Win32_MemoryArrayDevice -C 20
+# Discover class-stored payloads
+python wmi.py hunt -i /evidence/Repository
+
+# Extract every discovered payload and write an Excel report
+python wmi.py hunt -i /evidence/Repository --dump -f xlsx
 ```
 
-### Where to find OBJECTS.DATA
+| Option | Description |
+|---|---|
+| `-i, --input PATH` | **Required.** File or directory. |
+| `--dump [DIR]` | Extract discovered payloads to `DIR` (default: a folder next to the evidence). |
+| `--max-hits N` | Cap the number of payloads reported. Default `500`. |
+| `-f, --format {txt,xlsx}` | Output format. Default `txt`. |
+| `-o, --output FILE` | Write report to `FILE`. |
+
+> Extracted payloads are **live malware** — dumping a real sample to disk may
+> trigger antivirus/EDR quarantine. Handle in an isolated analysis environment.
+
+> **Best-effort, not a full CIM parser.** The structured decode does not read
+> `INDEX.BTR` or reconstruct the full object graph, so it can miss or mislabel
+> fields on damaged records and automatically falls back to the raw string view
+> when it recovers no structure. For authoritative class parsing, cross-check
+> with FLARE [python-cim](https://github.com/mandiant/flare-wmi). On Windows,
+> the wrappers in `scripts/` run the carver through the launcher for you.
+
+### `rua` mode — SCCM software-execution history
+
+`CCM_RecentlyUsedApps` records are written by the SCCM software-metering agent
+and stored inside the same WMI repository. Each is strong evidence that a
+program **executed** — including its full path, launch count, last-used time,
+and the user who ran it — and records often survive for programs that have been
+deleted. Recover them with:
+
+```bash
+# Human-readable report
+python wmi.py rua -i /evidence/Repository
+
+# Excel workbook for triage / timeline building
+python wmi.py rua -i /evidence/Repository -f xlsx -o rua.xlsx
+```
+
+| Option | Description |
+|---|---|
+| `-i, --input PATH` | **Required.** File or directory (same resolution as `persistence` mode). |
+| `-f, --format {txt,xlsx}` | Output format. Default `txt`. xlsx requires `-o`. |
+| `-o, --output FILE` | Write to `FILE` instead of stdout. |
+| `--max-records N` | Cap the number of records reported (0 = unlimited). |
+
+Three record formats are recovered and labelled: `vista_full` / `xp_full`
+(complete records with a binary header carrying the two FILETIMEs, file size,
+and launch count), `carved` (body recovered without a parseable header — no
+timestamps), and `xml`. Duplicate carvings of the same application are merged,
+keeping the richest record.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Completed (report produced; may contain zero findings). |
+| `1` | Input not found / could not resolve `OBJECTS.DATA`. |
+| `2` | Unexpected error, or an unsupported option combination. |
+| `130` | Interrupted (Ctrl-C). |
+
+### Where to find the repository
 
 ```
 C:\Windows\System32\wbem\Repository\OBJECTS.DATA          # Vista+
 C:\Windows\System32\wbem\Repository\FS\OBJECTS.DATA       # XP / legacy
 ```
 
-Acquire with your standard forensic imaging workflow.  The tool reads the
-file read-only; it never writes to the evidence.
+Acquire with your standard forensic imaging workflow. The tool opens the file
+**read-only** and never writes to the evidence.
 
 ### Mapping files (optional but recommended)
 
@@ -98,49 +288,44 @@ C:\Windows\System32\wbem\Repository\MAPPING1.MAP
 C:\Windows\System32\wbem\Repository\MAPPING2.MAP
 ```
 
-If MAPPING*.MAP is present in the same directory as OBJECTS.DATA, it is
-auto-detected.  Supply it explicitly with `-m` if it is elsewhere.  
-Without a mapping file every artefact is labelled `recovered_state: unknown`.
+If a `MAPPING*.MAP` is present next to `OBJECTS.DATA` it is auto-detected (the
+most recently modified one is used). Supply it explicitly with `-m` if it lives
+elsewhere. Without a mapping file, allocation state cannot be determined and
+every artefact is labelled `recovered_state: unknown`.
 
 ---
 
 ## Output formats
 
+Every mode outputs **`txt`** (default, to stdout or `-o`) or **`xlsx`** (a
+structured workbook, `-o FILE` required). There is no per-cell character limit
+beyond Excel's own hard 32 767-char maximum; the `txt` report is never
+truncated. The `.xlsx` writer is pure standard library — no dependencies, no
+`pip install`.
+
 ### Text (default)
 
-Human-readable, colour-coded by risk level.  Each binding shows:
-- Risk score and level with full factor breakdown
-- Binding details (consumer name, filter name, namespace, file offset)
-- Filter details (WQL query, namespace)
-- Consumer details (command line / script text / etc.)
-- Parse warnings where extraction was incomplete
+Human-readable. For `persistence`, colour-coded by risk level; each binding
+shows the risk score with full factor breakdown, binding/filter/consumer
+details with file offsets, and parse warnings. For `rua`, one block per record.
+For `carve`, the structured class-definition view (or the raw string view with
+`--raw`).
 
-### JSON
+### XLSX
 
-Stable schema suitable for SIEM ingestion, Splunk, Elastic, or custom
-pipelines.  Top-level structure:
+A multi-sheet workbook, ordered and complete, ready for triage in Excel. Header
+row is bold and frozen; columns auto-size. Sheets per mode:
 
-```json
-{
-  "scan_metadata": { "tool", "version", "scan_timestamp", "objects_data_path" },
-  "summary": { "total_bundles", "critical", "high", "medium", "low",
-               "orphaned_filters", "orphaned_consumers" },
-  "bundles": [ ... ],
-  "orphaned_filters": [ ... ],
-  "orphaned_consumers": [ ... ]
-}
-```
-
-Each bundle includes `artifact_id`, `risk_score`, `risk_level`, full binding /
-filter / consumer objects with offsets and `recovered_state`, and
-`detection_reasons` (list of `{factor, contribution, explanation}`).
-
-### CSV / TSV
-
-Tab-separated.  One row per binding.  Useful for Excel triage.
+| Mode | Sheets |
+|---|---|
+| `persistence` | Summary · Bindings · Risk Factors · Orphaned Filters · Orphaned Consumers |
+| `rua` | CCM_RecentlyUsedApps (one row per record) |
+| `carve` | Classes · Properties · Default Values (or a single sheet in `--raw`) |
 
 ```bash
-wmi-persistence -i OBJECTS.DATA -f csv -o triage.tsv
+python wmi.py persistence -i /evidence/Repository -f xlsx -o findings.xlsx
+python wmi.py rua         -i /evidence/Repository -f xlsx -o rua.xlsx
+python wmi.py carve       -i /evidence/Repository --find Win32_Process -f xlsx -o class.xlsx
 ```
 
 ---
@@ -202,10 +387,12 @@ These bindings are present on clean Windows systems and score 0.0:
 
 ```
 OBJECTS.DATA  ──►  binary_reader  ──►  carver  ──►  correlator  ──►  heuristics  ──►  reporter
-                   (page I/O)         (pattern      (link           (risk            (text /
-                   MAPPING*.MAP        matching)     artefacts)       scoring)         JSON /
-                   allocation                                                          CSV)
+                   (page I/O)         (pattern      (link           (risk            (txt /
+                   MAPPING*.MAP        matching)     artefacts)       scoring)         xlsx)
+                   allocation
                    labelling
+
+Side channels:  ccm_rua (SCCM RUA records) · cim (structured class decode) · xlsx_writer
 ```
 
 ### Encoding strategy
@@ -225,9 +412,19 @@ The carver searches for both encodings at every chunk boundary.
 
 ## Running tests
 
+The tool itself needs no install, but the test runner (`pytest`) is a dev
+dependency:
+
 ```bash
-pip install -e ".[dev]"
+pip install -e ".[dev]"      # one-time, for the test suite only
 pytest
+```
+
+Or, without installing the package, point `pytest` at `src/`:
+
+```bash
+pip install pytest
+PYTHONPATH=src pytest
 ```
 
 Tests use synthetic binary fixtures — no real OBJECTS.DATA required.
@@ -249,8 +446,10 @@ Tests use synthetic binary fixtures — no real OBJECTS.DATA required.
 | Deleted artefacts | Theoretical (untested) | Explicit MAPPING*.MAP integration |
 | Orphan detection | None | Filters and consumers reported separately |
 | Risk scoring | Hard-coded BVT/SCM check | Documented multi-factor scoring |
-| Output formats | Text only | Text + JSON + CSV |
+| Output formats | Text only | Text + native XLSX (no dependencies) |
 | Error handling | Crashes on bad input | Logged, continues scan |
+| CCM_RUA carving | Fragile 50-byte seeking, `str < int` bug, no length guards | Single-pass regex, typed records, header length-guarded, txt/xlsx |
+| Class definitions | grep + external flare-wmi | Built-in best-effort structured decode (full, untruncated values) |
 
 ### What remains heuristic
 
@@ -287,18 +486,20 @@ field in every artefact lets you jump directly to the source bytes.
 
 ## Legacy tools
 
-The original Python 2 scripts are preserved in `legacy/` for reference:
+The original Python 2 scripts are preserved in `legacy/` for reference. Both
+have been reimplemented in this version — they run on neither Python 3 nor are
+maintained, and are kept only for provenance:
 
-- `legacy/PyWMIPersistenceFinder.py` — original binding finder
-- `legacy/CCM_RUA_Finder.py` — SCCM RecentlyUsedApps extractor
-
-They are not maintained and will not run on Python 3.
+- `legacy/PyWMIPersistenceFinder.py` — original binding finder → reimplemented
+  and extended as the `persistence` mode.
+- `legacy/CCM_RUA_Finder.py` — SCCM RecentlyUsedApps extractor → reimplemented
+  (bytes-safe, single-pass, typed records, txt/xlsx output) as the `rua` mode.
 
 ---
 
 ## License
 
-MIT — see source files for full text.
+MIT — see [LICENSE](LICENSE).
 
-Original work by David Pany (Mandiant/FireEye) 2017.  
-Modernised and extended for Python 3 / DFIR use 2024–2025.
+Based on the original **WMI_Forensics** by David Pany (Mandiant/FireEye, 2017),
+rewritten for Python 3 and extended for modern DFIR use.

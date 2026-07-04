@@ -137,9 +137,24 @@ class WMIBinaryReader:
         return RecoveredState.ACTIVE if allocated else RecoveredState.DELETED_RECOVERED
 
 
-def find_mapping_file(objects_path: Path) -> Path | None:
-    """Return the most recently modified MAPPING*.MAP next to OBJECTS.DATA."""
-    candidates = list(objects_path.parent.glob("MAPPING*.MAP"))
+def newest_mapping(directory: Path) -> Path | None:
+    """
+    Return the most recently modified MAPPING*.MAP in *directory*, or None.
+
+    Matches both upper- and lower-case extensions so it behaves the same on
+    case-sensitive (Linux evidence mounts) and case-insensitive (Windows)
+    filesystems.  When two mapping files exist, the newest is the live one.
+    """
+    candidates = {
+        p.resolve(): p
+        for pattern in ("MAPPING*.MAP", "MAPPING*.map")
+        for p in directory.glob(pattern)
+    }
     if not candidates:
         return None
-    return max(candidates, key=lambda p: p.stat().st_mtime)
+    return max(candidates.values(), key=lambda p: p.stat().st_mtime)
+
+
+def find_mapping_file(objects_path: Path) -> Path | None:
+    """Return the most recently modified MAPPING*.MAP next to OBJECTS.DATA."""
+    return newest_mapping(objects_path.parent)

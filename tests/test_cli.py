@@ -86,39 +86,33 @@ class TestResolveInput:
         assert result == od
 
 
-class TestClassModeCli:
-    def test_parser_accepts_class_mode_args(self):
+class TestPersistenceCli:
+    def test_parser_defaults_to_txt(self):
         p = _build_parser()
-        args = p.parse_args([
-            "-i", "OBJECTS.DATA",
-            "--class-find", "Win32_MemoryArrayDevice",
-            "-C", "5",
-            "--class-max-hits", "3",
-        ])
-        assert args.class_find == "Win32_MemoryArrayDevice"
-        assert args.context == 5
-        assert args.class_max_hits == 3
+        args = p.parse_args(["-i", "OBJECTS.DATA"])
+        assert args.output_format == "txt"
 
-    def test_main_class_mode_text(self, tmp_path, monkeypatch, capsys):
+    def test_xlsx_without_output_writes_next_to_evidence(self, tmp_path, monkeypatch):
         od = _make_od(tmp_path)
-        od.write_bytes(
-            b"header\x00Win32_MemoryArrayDevice\x00\x00payload\x00\x00"
-        )
         monkeypatch.setattr(
             "sys.argv",
-            ["wmi-persistence", "-i", str(od), "--class-find", "Win32_MemoryArrayDevice", "-C", "2"],
+            ["wmi-persistence", "-i", str(od), "-f", "xlsx"],
         )
         rc = main()
-        out = capsys.readouterr().out
         assert rc == 0
-        assert "WMI Class Carver" in out
-        assert "Win32_MemoryArrayDevice" in out
+        # A wmi_persistence_*.xlsx report is written beside OBJECTS.DATA.
+        reports = list(tmp_path.glob("wmi_persistence_*.xlsx"))
+        assert len(reports) == 1
+        assert reports[0].read_bytes()[:2] == b"PK"
 
-    def test_main_class_mode_rejects_csv(self, tmp_path, monkeypatch):
+    def test_xlsx_writes_file(self, tmp_path, monkeypatch):
         od = _make_od(tmp_path)
+        out = tmp_path / "report.xlsx"
         monkeypatch.setattr(
             "sys.argv",
-            ["wmi-persistence", "-i", str(od), "--class-find", "Win32_MemoryArrayDevice", "-f", "csv"],
+            ["wmi-persistence", "-i", str(od), "-f", "xlsx", "-o", str(out)],
         )
         rc = main()
-        assert rc == 2
+        assert rc == 0
+        assert out.exists()
+        assert out.read_bytes()[:2] == b"PK"  # zip magic

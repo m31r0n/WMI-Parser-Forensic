@@ -10,10 +10,7 @@ JSON top-level schema:
 
 from __future__ import annotations
 
-import csv
-import dataclasses
 import io
-import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -29,6 +26,7 @@ from .models import (
     SMTPEventConsumer,
     WMIPersistenceBundle,
 )
+from .xlsx_writer import Sheet, workbook_bytes
 
 _RISK_COLOUR = {
     "low":      "\033[32m",
@@ -42,7 +40,7 @@ _RESET = "\033[0m"
 
 def write_report(
     correlation_result: CorrelationResult,
-    fmt: str = "text",
+    fmt: str = "txt",
     output_file: Path | None = None,
     objects_path: Path | None = None,
     mapping_path: Path | None = None,
@@ -50,6 +48,13 @@ def write_report(
     min_risk_score: float = 0.0,
     use_colour: bool = True,
 ) -> str:
+    """
+    Render the correlation result.
+
+    ``txt``  : returns the report text (also written to *output_file* if given).
+    ``xlsx`` : writes a multi-sheet workbook to *output_file* (required) and
+               returns an empty string — a binary workbook cannot go to stdout.
+    """
     all_bundles = correlation_result.bundles
     suppressed_legitimate = [b for b in all_bundles if b.is_known_legitimate and not include_legitimate]
     bundles = [
@@ -58,16 +63,18 @@ def write_report(
         and b.risk_score >= min_risk_score
     ]
 
-    if fmt == "json":
-        content = _json(bundles, correlation_result.orphaned_filters,
-                        correlation_result.orphaned_consumers, objects_path, mapping_path)
-    elif fmt in ("csv", "tsv"):
-        content = _csv(bundles)
-    else:
-        content = _text(bundles, correlation_result.orphaned_filters,
-                        correlation_result.orphaned_consumers, use_colour,
-                        suppressed_legitimate=suppressed_legitimate)
+    if fmt == "xlsx":
+        if output_file is None:
+            raise ValueError("xlsx format requires an output file (-o FILE)")
+        output_file.write_bytes(_xlsx(
+            bundles, correlation_result.orphaned_filters,
+            correlation_result.orphaned_consumers, objects_path, mapping_path,
+        ))
+        return ""
 
+    content = _text(bundles, correlation_result.orphaned_filters,
+                    correlation_result.orphaned_consumers, use_colour,
+                    suppressed_legitimate=suppressed_legitimate)
     if output_file:
         output_file.write_text(content, encoding="utf-8")
     return content
@@ -230,94 +237,113 @@ def _consumer_details(c: EventConsumer, out: io.StringIO) -> None:
 
 
 # ---------------------------------------------------------------------------
-# JSON
+# XLSX (multi-sheet workbook)
 # ---------------------------------------------------------------------------
 
-def _serialise(obj):
-    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
-        return {k: _serialise(v) for k, v in dataclasses.asdict(obj).items()}
-    if isinstance(obj, bytes):
-        return obj.hex()
-    if hasattr(obj, "value"):
-        return obj.value
-    if isinstance(obj, list):
-        return [_serialise(i) for i in obj]
-    if isinstance(obj, dict):
-        return {k: _serialise(v) for k, v in obj.items()}
-    return obj
-
-
-def _json(
-    bundles, orphaned_filters, orphaned_consumers, objects_path, mapping_path
-) -> str:
-    doc = {
-        "scan_metadata": {
-            "tool": "wmi-forensics",
-            "version": __version__,
-            "scan_timestamp": datetime.now(timezone.utc).isoformat(),
-            "objects_data_path": str(objects_path) if objects_path else None,
-            "mapping_file_path": str(mapping_path) if mapping_path else None,
-        },
-        "summary": {
-            "total_bundles":      len(bundles),
-            "critical":           sum(1 for b in bundles if b.risk_level == "critical"),
-            "high":               sum(1 for b in bundles if b.risk_level == "high"),
-            "medium":             sum(1 for b in bundles if b.risk_level == "medium"),
-            "low":                sum(1 for b in bundles if b.risk_level == "low"),
-            "orphaned_filters":   len(orphaned_filters),
-            "orphaned_consumers": len(orphaned_consumers),
-        },
-        "bundles":            [_serialise(b) for b in sorted(bundles, key=lambda b: b.risk_score, reverse=True)],
-        "orphaned_filters":   [_serialise(f) for f in orphaned_filters],
-        "orphaned_consumers": [_serialise(c) for c in orphaned_consumers],
-    }
-    return json.dumps(doc, indent=2, ensure_ascii=False)
-
-
-# ---------------------------------------------------------------------------
-# CSV
-# ---------------------------------------------------------------------------
-
-_CSV_FIELDS = [
-    "artifact_id", "risk_level", "risk_score",
-    "consumer_name", "consumer_type", "filter_name", "namespace",
-    "query", "command_or_script",
-    "binding_offset", "binding_state", "binding_confidence",
-    "is_orphaned", "is_incomplete", "is_known_legitimate",
-    "detection_summary",
+_BINDING_COLUMNS = [
+    "risk_level", "risk_score", "consumer_name", "consumer_type", "filter_name",
+    "namespace", "query", "command_or_script", "binding_offset", "binding_state",
+    "binding_confidence", "is_orphaned", "is_incomplete", "is_known_legitimate",
+    "detection_summary", "artifact_id",
 ]
 
 
-def _csv(bundles: list[WMIPersistenceBundle]) -> str:
-    out = io.StringIO()
-    writer = csv.DictWriter(out, fieldnames=_CSV_FIELDS, delimiter="\t",
-                            extrasaction="ignore", lineterminator="\n")
-    writer.writeheader()
+def _command_or_script(b: WMIPersistenceBundle) -> str:
+    if isinstance(b.consumer, CommandLineEventConsumer):
+        return b.consumer.command_line_template or b.consumer.executable_path
+    if isinstance(b.consumer, ActiveScriptEventConsumer):
+        return b.consumer.script_text  # full text, not truncated
+    return ""
 
-    for b in sorted(bundles, key=lambda b: b.risk_score, reverse=True):
-        cmd_or_script = ""
-        if isinstance(b.consumer, CommandLineEventConsumer):
-            cmd_or_script = b.consumer.command_line_template
-        elif isinstance(b.consumer, ActiveScriptEventConsumer):
-            cmd_or_script = b.consumer.script_text[:500]
 
-        writer.writerow({
-            "artifact_id":       b.artifact_id,
-            "risk_level":        b.risk_level,
-            "risk_score":        f"{b.risk_score:.3f}",
-            "consumer_name":     b.consumer.name if b.consumer else (b.binding.consumer_name if b.binding else ""),
-            "consumer_type":     b.consumer.consumer_type if b.consumer else (b.binding.consumer_type if b.binding else ""),
-            "filter_name":       b.event_filter.name if b.event_filter else (b.binding.filter_name if b.binding else ""),
-            "namespace":         (b.binding.namespace if b.binding else "") or (b.event_filter.namespace if b.event_filter else ""),
-            "query":             b.event_filter.query if b.event_filter else "",
-            "command_or_script": cmd_or_script,
-            "binding_offset":    f"0x{b.binding.offset:08X}" if b.binding and b.binding.offset >= 0 else "",
-            "binding_state":     b.binding.recovered_state.value if b.binding else "",
-            "binding_confidence": f"{b.binding.confidence:.0%}" if b.binding else "",
-            "is_orphaned":       b.is_orphaned,
-            "is_incomplete":     b.is_incomplete,
-            "is_known_legitimate": b.is_known_legitimate,
-            "detection_summary": "; ".join(r.factor for r in b.detection_reasons),
-        })
+def _xlsx(
+    bundles, orphaned_filters, orphaned_consumers, objects_path, mapping_path
+) -> bytes:
+    ordered = sorted(bundles, key=lambda b: b.risk_score, reverse=True)
 
-    return out.getvalue()
+    crit = sum(1 for b in bundles if b.risk_level == "critical")
+    high = sum(1 for b in bundles if b.risk_level == "high")
+    med = sum(1 for b in bundles if b.risk_level == "medium")
+    low = sum(1 for b in bundles if b.risk_level == "low")
+
+    top = ordered[0] if ordered else None
+    if crit or high:
+        verdict = f"ACTION REQUIRED — {crit + high} high/critical persistence binding(s) found"
+    elif med:
+        verdict = f"REVIEW — {med} medium-risk binding(s) warrant manual investigation"
+    elif bundles:
+        verdict = "LOW — bindings present but none scored above low risk"
+    else:
+        verdict = "CLEAN — no WMI event-subscription persistence detected"
+
+    summary_rows = [
+        ["Report", "WMI event-subscription persistence"],
+        ["Tool", f"wmi-forensics {__version__}"],
+        ["Generated (UTC)", datetime.now(timezone.utc).isoformat()],
+        ["OBJECTS.DATA", str(objects_path) if objects_path else ""],
+        ["MAPPING file", str(mapping_path) if mapping_path else "(none — allocation state UNKNOWN)"],
+        ["", ""],
+        ["ASSESSMENT", verdict],
+        ["Top finding", top.display_name() if top else "(none)"],
+        ["Top risk", f"{top.risk_level} {top.risk_score:.2f}" if top else ""],
+        ["Recommended action",
+         "Confirm each finding in hex at its offset; treat active high/critical "
+         "bindings as live persistence and contain the host." if (crit or high)
+         else "Review medium findings and the risk factors sheet."],
+        ["", ""],
+        ["Total bindings", len(bundles)],
+        ["Critical", crit],
+        ["High", high],
+        ["Medium", med],
+        ["Low", low],
+        ["Orphaned filters", len(orphaned_filters)],
+        ["Orphaned consumers", len(orphaned_consumers)],
+        ["Note", "Triage scores, not verdicts — always confirm in the raw bytes."],
+    ]
+
+    binding_rows = []
+    for b in ordered:
+        binding_rows.append([
+            b.risk_level,
+            round(b.risk_score, 3),
+            b.consumer.name if b.consumer else (b.binding.consumer_name if b.binding else ""),
+            b.consumer.consumer_type if b.consumer else (b.binding.consumer_type if b.binding else ""),
+            b.event_filter.name if b.event_filter else (b.binding.filter_name if b.binding else ""),
+            (b.binding.namespace if b.binding else "") or (b.event_filter.namespace if b.event_filter else ""),
+            b.event_filter.query if b.event_filter else "",
+            _command_or_script(b),
+            f"0x{b.binding.offset:08X}" if b.binding and b.binding.offset >= 0 else "",
+            b.binding.recovered_state.value if b.binding else "",
+            f"{b.binding.confidence:.0%}" if b.binding else "",
+            b.is_orphaned,
+            b.is_incomplete,
+            b.is_known_legitimate,
+            "; ".join(r.factor for r in b.detection_reasons),
+            b.artifact_id,
+        ])
+
+    factor_rows = [
+        [b.display_name(), b.risk_level, r.factor, round(r.contribution, 3), r.explanation]
+        for b in ordered for r in sorted(b.detection_reasons, key=lambda x: x.contribution, reverse=True)
+    ]
+
+    filter_rows = [
+        [f.name, f.query, f"0x{f.offset:08X}" if f.offset >= 0 else "",
+         f.recovered_state.value, f"{f.confidence:.0%}"]
+        for f in orphaned_filters
+    ]
+    consumer_rows = [
+        [c.name, c.consumer_type, c.namespace,
+         f"0x{c.offset:08X}" if c.offset >= 0 else "", c.recovered_state.value,
+         f"{c.confidence:.0%}"]
+        for c in orphaned_consumers
+    ]
+
+    sheets = [
+        Sheet("Summary", ["Field", "Value"], summary_rows),
+        Sheet("Bindings", _BINDING_COLUMNS, binding_rows),
+        Sheet("Risk Factors", ["binding", "risk_level", "factor", "contribution", "explanation"], factor_rows),
+        Sheet("Orphaned Filters", ["name", "query", "offset", "state", "confidence"], filter_rows),
+        Sheet("Orphaned Consumers", ["name", "type", "namespace", "offset", "state", "confidence"], consumer_rows),
+    ]
+    return workbook_bytes(sheets)

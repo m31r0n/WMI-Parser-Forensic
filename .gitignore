@@ -25,11 +25,24 @@ MAPPING*.map
 INDEX.BTR
 INDEX.btr
 
-# Tool output files
+# Tool output files (reports, triage exports, carved hits)
+output/
 *.xls
+*.xlsx
 *.tsv
 report.json
 report.txt
+triage*.csv
+class-hits*.json
+
+# Auto-named reports and extracted payloads (default to the evidence folder)
+wmi_*.xlsx
+wmi_*_payloads_*/
+
+# Recovered/extracted binaries — NEVER commit dumped malware to a public repo
+*.exe
+*.dll
+*.bin
 
 # OS
 .DS_Store

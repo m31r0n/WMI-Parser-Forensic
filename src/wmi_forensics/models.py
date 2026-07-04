@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
@@ -141,6 +142,55 @@ class GenericEventConsumer(EventConsumer):
 
 
 @dataclass
+class CCMRecentlyUsedApp:
+    """
+    A single SCCM software-metering ``CCM_RecentlyUsedApps`` record recovered
+    from the WMI repository. Strong evidence of software execution.
+
+    ``record_format`` is one of:
+        vista_full  full null-delimited record with a Vista+ binary header
+        xp_full     full null-delimited record with an XP binary header
+        carved      null-delimited body without a parseable header
+        xml         XML-serialised record
+
+    The two FILETIME values (``timestamp_1`` / ``timestamp_2``) come from the
+    binary header and are only present on ``*_full`` records.
+    """
+    explorer_file_name: str = ""
+    folder_path: str = ""
+    last_used_time: str = ""          # normalised "YYYY-MM-DD HH:MM:SS"
+    last_user_name: str = ""
+    launch_count: int | None = None
+    file_size: int | None = None
+    file_description: str = ""
+    company_name: str = ""
+    product_name: str = ""
+    product_version: str = ""
+    file_version: str = ""
+    original_file_name: str = ""
+    msi_display_name: str = ""
+    msi_publisher: str = ""
+    msi_version: str = ""
+    product_code: str = ""
+    product_language: str = ""
+    additional_product_codes: str = ""
+    file_properties_hash: str = ""
+    software_properties_hash: str = ""
+    time_zone_offset: str = ""
+    timestamp_1: str = ""             # FILETIME from header (record create)
+    timestamp_2: str = ""             # FILETIME from header (record modify)
+    record_format: str = ""
+    offset: int = -1
+    file_path: str = ""
+
+    def display_name(self) -> str:
+        name = self.explorer_file_name or self.original_file_name or "?"
+        if self.folder_path:
+            return f"{self.folder_path}\\{name}"
+        return name
+
+
+@dataclass
 class FilterToConsumerBinding:
     consumer_name: str
     consumer_type: str
@@ -196,21 +246,31 @@ class WMIPersistenceBundle:
         return f"{consumer_name} -> {filter_name}"
 
 
+def to_serialisable(obj: Any) -> Any:
+    """
+    Recursively convert dataclasses / enums / bytes into JSON-serialisable values.
+
+    - dataclass instances -> dict
+    - bytes               -> hex string
+    - Enum                -> its .value
+    - list / dict         -> recursed element-wise
+
+    This is the single serialisation routine used by both ``bundle_to_dict``
+    and the JSON reporter.
+    """
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        return {k: to_serialisable(v) for k, v in dataclasses.asdict(obj).items()}
+    if isinstance(obj, bytes):
+        return obj.hex()
+    if hasattr(obj, "value"):
+        return obj.value
+    if isinstance(obj, list):
+        return [to_serialisable(i) for i in obj]
+    if isinstance(obj, dict):
+        return {k: to_serialisable(v) for k, v in obj.items()}
+    return obj
+
+
 def bundle_to_dict(bundle: WMIPersistenceBundle) -> dict[str, Any]:
     """Convert a WMIPersistenceBundle to a JSON-serialisable dictionary."""
-    import dataclasses
-
-    def walk(obj: Any) -> Any:
-        if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
-            return {k: walk(v) for k, v in dataclasses.asdict(obj).items()}
-        if isinstance(obj, bytes):
-            return obj.hex()
-        if hasattr(obj, "value"):
-            return obj.value
-        if isinstance(obj, list):
-            return [walk(i) for i in obj]
-        if isinstance(obj, dict):
-            return {k: walk(v) for k, v in obj.items()}
-        return obj
-
-    return walk(bundle)
+    return to_serialisable(bundle)
